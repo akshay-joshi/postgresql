@@ -4,9 +4,9 @@ CREATE ROLE test_database_ddl_role WITH SUPERUSER;
 CREATE DATABASE "test_get_database_ddl"
     OWNER test_database_ddl_role ENCODING utf8 LC_COLLATE "C" LC_CTYPE "C" TEMPLATE template0;
 SELECT pg_get_database_ddl('test_get_database_ddl', false);
-                                                                                                    pg_get_database_ddl                                                                                                     
-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-  CREATE DATABASE test_get_database_ddl WITH OWNER = test_database_ddl_role ENCODING = "UTF8" LC_COLLATE = "C" LC_CTYPE = "C" LOCALE_PROVIDER = 'libc' TABLESPACE = pg_default ALLOW_CONNECTIONS = 1 CONNECTION LIMIT = -1;
+                                                                                                      pg_get_database_ddl                                                                                                      
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+  CREATE DATABASE test_get_database_ddl WITH OWNER = test_database_ddl_role ENCODING = "UTF8" LC_COLLATE = "C" LC_CTYPE = "C" LOCALE_PROVIDER = 'libc' TABLESPACE = pg_default ALLOW_CONNECTIONS = true CONNECTION LIMIT = -1;
 (1 row)
 
 DROP DATABASE "test_get_database_ddl";
@@ -15,9 +15,9 @@ CREATE DATABASE "test_get_database_ddl_builtin"
     OWNER test_database_ddl_role TEMPLATE template0 ENCODING 'UTF8'
     BUILTIN_LOCALE 'C.UTF-8' LOCALE_PROVIDER 'builtin';
 SELECT pg_get_database_ddl('test_get_database_ddl_builtin', false);
-                                                                                                                                     pg_get_database_ddl                                                                                                                                      
-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-  CREATE DATABASE test_get_database_ddl_builtin WITH OWNER = test_database_ddl_role ENCODING = "UTF8" LC_COLLATE = "C" LC_CTYPE = "UTF-8" BUILTIN_LOCALE = "C.UTF-8" COLLATION_VERSION = "1" LOCALE_PROVIDER = 'builtin' TABLESPACE = pg_default ALLOW_CONNECTIONS = 1 CONNECTION LIMIT = -1;
+                                                                                                                                       pg_get_database_ddl                                                                                                                                       
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+  CREATE DATABASE test_get_database_ddl_builtin WITH OWNER = test_database_ddl_role ENCODING = "UTF8" LC_COLLATE = "C" LC_CTYPE = "UTF-8" BUILTIN_LOCALE = "C.UTF-8" COLLATION_VERSION = "1" LOCALE_PROVIDER = 'builtin' TABLESPACE = pg_default ALLOW_CONNECTIONS = true CONNECTION LIMIT = -1;
 (1 row)
 
 DROP DATABASE "test_get_database_ddl_builtin";
@@ -26,9 +26,9 @@ CREATE DATABASE "test_get_database_ddl_conn"
     OWNER test_database_ddl_role TEMPLATE template0 ENCODING 'UTF8'
     ALLOW_CONNECTIONS 0 CONNECTION LIMIT 50;
 SELECT pg_get_database_ddl('test_get_database_ddl_conn', false);
-                                                                                              pg_get_database_ddl                                                                                              
----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-  CREATE DATABASE test_get_database_ddl_conn WITH OWNER = test_database_ddl_role ENCODING = "UTF8" LC_COLLATE = "C" LC_CTYPE = "UTF-8" LOCALE_PROVIDER = 'libc' TABLESPACE = pg_default CONNECTION LIMIT = 50;
+                                                                                                           pg_get_database_ddl                                                                                                           
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+  CREATE DATABASE test_get_database_ddl_conn WITH OWNER = test_database_ddl_role ENCODING = "UTF8" LC_COLLATE = "C" LC_CTYPE = "UTF-8" LOCALE_PROVIDER = 'libc' TABLESPACE = pg_default ALLOW_CONNECTIONS = false CONNECTION LIMIT = 50;
 (1 row)
 
 DROP DATABASE "test_get_database_ddl_conn";
@@ -46,7 +46,7 @@ CREATE DATABASE test_get_database_ddl
 	LC_CTYPE = "C"
 	LOCALE_PROVIDER = 'libc'
 	TABLESPACE = pg_default
-	ALLOW_CONNECTIONS = 1
+	ALLOW_CONNECTIONS = true
 	CONNECTION LIMIT = -1
 ;
 (1 row)
@@ -67,7 +67,7 @@ CREATE DATABASE test_get_database_ddl_builtin
 	COLLATION_VERSION = "1"
 	LOCALE_PROVIDER = 'builtin'
 	TABLESPACE = pg_default
-	ALLOW_CONNECTIONS = 1
+	ALLOW_CONNECTIONS = true
 	CONNECTION LIMIT = -1
 ;
 (1 row)
@@ -86,6 +86,7 @@ CREATE DATABASE test_get_database_ddl_conn
 	LC_CTYPE = "UTF-8"
 	LOCALE_PROVIDER = 'libc'
 	TABLESPACE = pg_default
+	ALLOW_CONNECTIONS = false
 	CONNECTION LIMIT = 50
 ;
 (1 row)
