@@ -13778,7 +13778,9 @@ pg_get_database_ddl(PG_FUNCTION_ARGS)
 	/* Look up the database in pg_database */
 	tupleDatabase = SearchSysCache1(DATABASEOID, ObjectIdGetDatum(dbOid));
 	if (!HeapTupleIsValid(tupleDatabase))
-		elog(ERROR, "database %s does not exist", NameStr(*dbName));
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				 errmsg("database \"%s\" does not exist", NameStr(*dbName))));
 	dbForm = (Form_pg_database) GETSTRUCT(tupleDatabase);
 
 	initStringInfo(&buf);
