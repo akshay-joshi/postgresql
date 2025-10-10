@@ -33,12 +33,14 @@
 #include "catalog/pg_opclass.h"
 #include "catalog/pg_operator.h"
 #include "catalog/pg_partitioned_table.h"
+#include "catalog/pg_policy.h"
 #include "catalog/pg_proc.h"
 #include "catalog/pg_statistic_ext.h"
 #include "catalog/pg_trigger.h"
 #include "catalog/pg_type.h"
 #include "commands/defrem.h"
 #include "commands/tablespace.h"
+#include "commands/policy.h"
 #include "common/keywords.h"
 #include "executor/spi.h"
 #include "funcapi.h"
@@ -13737,4 +13739,178 @@ get_range_partbound_string(List *bound_datums)
 	appendStringInfoChar(buf, ')');
 
 	return buf->data;
+}
+
+/*
+ * get_formatted_string
+ *
+ * Return a formatted version of the string.
+ *
+ * pretty - If pretty is true, the output includes tabs (\t) and newlines (\n).
+ * noOfTabChars - indent with specified no of tabs.
+ * fmt - printf-style format string used by appendStringInfoVA.
+ */
+static void
+get_formatted_string(StringInfo buf, bool pretty, int noOfTabChars, const char *fmt,...)
+{
+	va_list		args;
+
+	if (pretty)
+	{
+		/* Indent with tabs */
+		for (int i = 0; i < noOfTabChars; i++)
+		{
+			appendStringInfoString(buf, "\t");
+		}
+	}
+	else
+		appendStringInfoChar(buf, ' ');
+
+	va_start(args, fmt);
+	appendStringInfoVA(buf, fmt, args);
+	va_end(args);
+
+	/* If pretty mode, append newline at the end */
+	if (pretty)
+		appendStringInfoChar(buf, '\n');
+}
+
+/*
+ * pg_get_policy_ddl
+ *
+ * Generate a CREATE POLICY statement for the specified policy.
+ *
+ * tableID - Table ID of the policy.
+ * policyName - Name of the policy for which to generate the DDL.
+ * pretty - If true, format the DDL with indentation and line breaks.
+ */
+Datum
+pg_get_policy_ddl(PG_FUNCTION_ARGS)
+{
+	Oid			tableID = PG_GETARG_OID(0);
+	Name		policyName = PG_GETARG_NAME(1);
+	bool		pretty = PG_GETARG_BOOL(2);
+	HeapTuple	tuplePolicy;
+	Relation	pgPolicyRel;
+	Relation	targetTable;
+	Form_pg_policy policyForm;
+	ScanKeyData skey[2];
+	SysScanDesc sscan;
+
+	StringInfoData buf;
+	initStringInfo(&buf);
+
+	targetTable = relation_open(tableID, NoLock);
+	/* Find policy to begin scan */
+	pgPolicyRel = table_open(PolicyRelationId, RowExclusiveLock);
+
+	/* Set key - policy's relation id. */
+	ScanKeyInit(&skey[0],
+				Anum_pg_policy_polrelid,
+				BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(tableID));
+
+	/* Set key - policy's name. */
+	ScanKeyInit(&skey[1],
+				Anum_pg_policy_polname,
+				BTEqualStrategyNumber, F_NAMEEQ,
+				CStringGetDatum(NameStr(*policyName)));
+
+	sscan = systable_beginscan(pgPolicyRel,
+							   PolicyPolrelidPolnameIndexId, true, NULL, 2,
+							   skey);
+
+	tuplePolicy = systable_getnext(sscan);
+	/* Check that the policy is found, raise an error if not. */
+	if (!HeapTupleIsValid(tuplePolicy))
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				 errmsg("policy \"%s\" for table \"%s\" does not exist",
+						NameStr(*policyName),
+						RelationGetRelationName(targetTable))));
+
+	policyForm = (Form_pg_policy) GETSTRUCT(tuplePolicy);
+
+	/* Build the CREATE POLICY statement */
+	get_formatted_string(&buf, pretty, 0, "CREATE POLICY %s ON %s",
+						 quote_identifier(NameStr(*policyName)),
+						 RelationGetRelationName(targetTable));
+
+	/* Check the type is PERMISSIVE or RESTRICTIVE */
+	get_formatted_string(&buf, pretty, 1,
+						 policyForm->polpermissive ? "AS PERMISSIVE" : "AS RESTRICTIVE");
+
+	/* Check command to which the policy applies */
+	get_formatted_string(&buf, pretty, 1, "FOR %s",
+						 get_policy_cmd_name(policyForm->polcmd));
+
+	/* Check if the policy has a TO list */
+	bool		attr_isnull;
+	Datum		value_datum = heap_getattr(tuplePolicy,
+										   Anum_pg_policy_polroles,
+										   RelationGetDescr(pgPolicyRel),
+										   &attr_isnull);
+	if (!attr_isnull)
+	{
+		ArrayType  *policy_roles = DatumGetArrayTypePCopy(value_datum);
+		int			nitems = ARR_DIMS(policy_roles)[0];
+		Oid		   *roles = (Oid *) ARR_DATA_PTR(policy_roles);
+		StringInfoData role_names;
+
+		initStringInfo(&role_names);
+
+		for (int i = 0; i < nitems; i++)
+		{
+			if (OidIsValid(roles[i]))
+			{
+				char	   *rolename = GetUserNameFromId(roles[i], false);
+
+				if (i > 0)
+					appendStringInfoString(&role_names, ", ");
+				appendStringInfoString(&role_names, rolename);
+			}
+		}
+
+		if (role_names.len > 0)
+			get_formatted_string(&buf, pretty, 1, "TO %s", role_names.data);
+	}
+
+	/* Check if the policy has a USING expr */
+	value_datum = heap_getattr(tuplePolicy,
+							   Anum_pg_policy_polqual,
+							   RelationGetDescr(pgPolicyRel),
+							   &attr_isnull);
+	if (!attr_isnull)
+	{
+		text	   *exprtext = DatumGetTextPP(value_datum);
+		text	   *using_expression = pg_get_expr_worker(exprtext,
+														  policyForm->polrelid, false);
+
+		get_formatted_string(&buf, pretty, 1, "USING (%s)",
+							 text_to_cstring(using_expression));
+	}
+
+	/* Check if the policy has a WITH CHECK expr */
+	value_datum = heap_getattr(tuplePolicy,
+							   Anum_pg_policy_polwithcheck,
+							   RelationGetDescr(pgPolicyRel),
+							   &attr_isnull);
+	if (!attr_isnull)
+	{
+		text	   *exprtext = DatumGetTextPP(value_datum);
+		text	   *check_expression = pg_get_expr_worker(exprtext,
+														  policyForm->polrelid, false);
+
+		get_formatted_string(&buf, pretty, 1, "WITH CHECK (%s)",
+							 text_to_cstring(check_expression));
+	}
+
+	appendStringInfoChar(&buf, ';');
+
+	/* Clean up. */
+	systable_endscan(sscan);
+	relation_close(targetTable, NoLock);
+	table_close(pgPolicyRel, RowExclusiveLock);
+
+	PG_RETURN_TEXT_P(string_to_text(buf.data));
 }
