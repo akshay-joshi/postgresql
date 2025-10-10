@@ -129,6 +129,33 @@ parse_policy_command(const char *cmd_name)
 }
 
 /*
+ * get_policy_cmd_name -
+ *	 helper function to convert char representation to full command strings.
+ *
+ * cmd -  Valid values are '*', 'r', 'a', 'w' and 'd'.
+ *
+ */
+char *
+get_policy_cmd_name(char cmd)
+{
+	switch (cmd)
+	{
+		case '*':
+			return "ALL";
+		case ACL_SELECT_CHR:
+			return "SELECT";
+		case ACL_INSERT_CHR:
+			return "INSERT";
+		case ACL_UPDATE_CHR:
+			return "UPDATE";
+		case ACL_DELETE_CHR:
+			return "DELETE";
+		default:
+			elog(ERROR, "unrecognized policy command");
+	}
+}
+
+/*
  * policy_role_list_to_array
  *	 helper function to convert a list of RoleSpecs to an array of
  *	 role id Datums.
