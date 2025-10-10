@@ -2543,6 +2543,86 @@ drop function rls_f(text);
 drop table rls_t, test_t;
 
 --
+-- Test for pg_get_policy_ddl(tableName, policyName, pretty) function.
+--
+CREATE TABLE rls_tbl_1 (
+    did         int primary key,
+    cid         int,
+    dlevel      int not null,
+    dauthor     name,
+    dtitle      text
+);
+GRANT ALL ON rls_tbl_1 TO public;
+CREATE TABLE rls_tbl_2 (
+    pguser      name primary key,
+    seclv       int
+);
+GRANT SELECT ON rls_tbl_2 TO public;
+
+-- Test PERMISSIVE and RESTRICTIVE
+CREATE POLICY rls_p1 ON rls_tbl_1 AS PERMISSIVE
+    USING (dlevel <= (SELECT seclv FROM rls_tbl_2 WHERE pguser = current_user));
+CREATE POLICY rls_p2 ON rls_tbl_1 AS RESTRICTIVE USING (cid <> 44 AND cid < 50);
+
+-- Test FOR ALL | SELECT | INSERT | UPDATE | DELETE
+CREATE POLICY rls_p3 ON rls_tbl_1 FOR ALL USING (dauthor = current_user);
+CREATE POLICY rls_p4 ON rls_tbl_1 FOR SELECT USING (cid % 2 = 0);
+CREATE POLICY rls_p5 ON rls_tbl_1 FOR INSERT WITH CHECK (cid % 2 = 1);
+CREATE POLICY rls_p6 ON rls_tbl_1 FOR UPDATE USING (cid % 2 = 0);
+CREATE POLICY rls_p7 ON rls_tbl_1 FOR DELETE USING (cid < 8);
+
+-- Test TO { role_name ... }
+CREATE POLICY rls_p8 ON rls_tbl_1 TO regress_rls_dave, regress_rls_alice USING (true);
+CREATE POLICY rls_p9 ON rls_tbl_1 TO regress_rls_exempt_user WITH CHECK (cid = (SELECT seclv FROM rls_tbl_2));
+
+-- Test NULL value
+SELECT pg_get_policy_ddl(NULL, 'rls_p1');
+SELECT pg_get_policy_ddl('tab1', NULL);
+SELECT pg_get_policy_ddl(NULL, NULL);
+
+-- Test -1 as table oid
+ SELECT pg_get_policy_ddl(-1, 'rls_p1');
+
+-- Table does not exist
+SELECT pg_get_policy_ddl('tab1', 'rls_p1');
+-- Policy does not exist
+SELECT pg_get_policy_ddl('rls_tbl_1', 'pol1');
+
+-- Without Pretty formatted
+SELECT pg_get_policy_ddl('rls_tbl_1', 'rls_p1');
+SELECT pg_get_policy_ddl('rls_tbl_1', 'rls_p2');
+SELECT pg_get_policy_ddl('rls_tbl_1', 'rls_p3');
+SELECT pg_get_policy_ddl('rls_tbl_1', 'rls_p4');
+SELECT pg_get_policy_ddl('rls_tbl_1', 'rls_p5');
+SELECT pg_get_policy_ddl('rls_tbl_1', 'rls_p6', false);
+SELECT pg_get_policy_ddl('rls_tbl_1', 'rls_p7', false);
+SELECT pg_get_policy_ddl('rls_tbl_1', 'rls_p8', false);
+SELECT pg_get_policy_ddl('rls_tbl_1', 'rls_p9', false);
+
+-- With Pretty formatted
+\pset format unaligned
+SELECT pg_get_policy_ddl('rls_tbl_1', 'rls_p1', true);
+SELECT pg_get_policy_ddl('rls_tbl_1', 'rls_p2', true);
+SELECT pg_get_policy_ddl('rls_tbl_1', 'rls_p3', true);
+SELECT pg_get_policy_ddl('rls_tbl_1', 'rls_p4', true);
+SELECT pg_get_policy_ddl('rls_tbl_1', 'rls_p5', true);
+SELECT pg_get_policy_ddl('rls_tbl_1', 'rls_p6', true);
+SELECT pg_get_policy_ddl('rls_tbl_1', 'rls_p7', true);
+SELECT pg_get_policy_ddl('rls_tbl_1', 'rls_p8', true);
+SELECT pg_get_policy_ddl('rls_tbl_1', 'rls_p9', true);
+
+-- Clean up objects created for testing pg_get_policy_ddl function.
+DROP POLICY rls_p1 ON rls_tbl_1;
+DROP POLICY rls_p2 ON rls_tbl_1;
+DROP POLICY rls_p3 ON rls_tbl_1;
+DROP POLICY rls_p4 ON rls_tbl_1;
+DROP POLICY rls_p5 ON rls_tbl_1;
+DROP POLICY rls_p6 ON rls_tbl_1;
+DROP POLICY rls_p7 ON rls_tbl_1;
+DROP POLICY rls_p8 ON rls_tbl_1;
+DROP POLICY rls_p9 ON rls_tbl_1;
+
+--
 -- Clean up objects
 --
 RESET SESSION AUTHORIZATION;
