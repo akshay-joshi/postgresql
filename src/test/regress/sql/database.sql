@@ -22,3 +22,58 @@ REASSIGN OWNED BY regress_datdba_before TO regress_datdba_after;
 DROP DATABASE regression_utf8;
 DROP ROLE regress_datdba_before;
 DROP ROLE regress_datdba_after;
+
+-- Without Pretty formatted
+-- Create a specific role to test
+CREATE ROLE regress_ddl_database WITH SUPERUSER;
+CREATE DATABASE "test_get_database_ddl"
+    OWNER regress_ddl_database ENCODING 'UTF8' LC_COLLATE "C" LC_CTYPE "C"
+    TEMPLATE template0;
+SELECT pg_get_database_ddl('test_get_database_ddl', false);
+DROP DATABASE "test_get_database_ddl";
+
+-- Test LOCAL_PROVIDER and BUILTIN_LOCALE for builtin type
+CREATE DATABASE "test_get_database_ddl_builtin"
+    OWNER regress_ddl_database TEMPLATE template0 ENCODING 'UTF8'
+    LC_COLLATE "C" LC_CTYPE "C"
+    BUILTIN_LOCALE 'C.UTF-8' LOCALE_PROVIDER 'builtin';
+SELECT pg_get_database_ddl('test_get_database_ddl_builtin', false);
+DROP DATABASE "test_get_database_ddl_builtin";
+
+-- Test ALLOW_CONNECTION and CONNECTION_LIMIT
+CREATE DATABASE "test_get_database_ddl_conn"
+    OWNER regress_ddl_database TEMPLATE template0 ENCODING 'UTF8'
+    LC_COLLATE "C" LC_CTYPE "C"
+    ALLOW_CONNECTIONS 0 CONNECTION LIMIT 50;
+SELECT pg_get_database_ddl('test_get_database_ddl_conn', false);
+DROP DATABASE "test_get_database_ddl_conn";
+
+-- Database doesn't exists
+SELECT pg_get_database_ddl('test_database', false);
+
+-- With Pretty formatted
+\pset format unaligned
+CREATE DATABASE "test_get_database_ddl"
+    OWNER regress_ddl_database ENCODING 'UTF8' LC_COLLATE "C" LC_CTYPE "C"
+    TEMPLATE template0;
+SELECT pg_get_database_ddl('test_get_database_ddl', true);
+DROP DATABASE "test_get_database_ddl";
+
+-- Test LOCAL_PROVIDER and BUILTIN_LOCALE for builtin type
+CREATE DATABASE "test_get_database_ddl_builtin"
+    OWNER regress_ddl_database TEMPLATE template0 ENCODING 'UTF8'
+    LC_COLLATE "C" LC_CTYPE "C"
+    BUILTIN_LOCALE 'C.UTF-8' LOCALE_PROVIDER 'builtin';
+SELECT pg_get_database_ddl('test_get_database_ddl_builtin', true);
+DROP DATABASE "test_get_database_ddl_builtin";
+
+-- Test ALLOW_CONNECTION and CONNECTION_LIMIT
+CREATE DATABASE "test_get_database_ddl_conn"
+    OWNER regress_ddl_database TEMPLATE template0 ENCODING 'UTF8'
+    LC_COLLATE "C" LC_CTYPE "C"
+    ALLOW_CONNECTIONS 0 CONNECTION LIMIT 50;
+SELECT pg_get_database_ddl('test_get_database_ddl_conn', true);
+DROP DATABASE "test_get_database_ddl_conn";
+
+-- Clean up
+DROP ROLE regress_ddl_database;
