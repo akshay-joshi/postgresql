@@ -13798,6 +13798,7 @@ pg_get_policy_ddl(PG_FUNCTION_ARGS)
 	SysScanDesc sscan;
 
 	StringInfoData buf;
+
 	initStringInfo(&buf);
 
 	targetTable = relation_open(tableID, NoLock);
@@ -13845,14 +13846,15 @@ pg_get_policy_ddl(PG_FUNCTION_ARGS)
 						 get_policy_cmd_name(policyForm->polcmd));
 
 	/* Check if the policy has a TO list */
-	bool		attr_isnull;
-	Datum		value_datum = heap_getattr(tuplePolicy,
-										   Anum_pg_policy_polroles,
-										   RelationGetDescr(pgPolicyRel),
-										   &attr_isnull);
-	if (!attr_isnull)
+	bool		attrIsnull;
+	Datum		valueDatum = heap_getattr(tuplePolicy,
+										  Anum_pg_policy_polroles,
+										  RelationGetDescr(pgPolicyRel),
+										  &attrIsnull);
+
+	if (!attrIsnull)
 	{
-		ArrayType  *policy_roles = DatumGetArrayTypePCopy(value_datum);
+		ArrayType  *policy_roles = DatumGetArrayTypePCopy(valueDatum);
 		int			nitems = ARR_DIMS(policy_roles)[0];
 		Oid		   *roles = (Oid *) ARR_DATA_PTR(policy_roles);
 		StringInfoData role_names;
@@ -13876,33 +13878,33 @@ pg_get_policy_ddl(PG_FUNCTION_ARGS)
 	}
 
 	/* Check if the policy has a USING expr */
-	value_datum = heap_getattr(tuplePolicy,
-							   Anum_pg_policy_polqual,
-							   RelationGetDescr(pgPolicyRel),
-							   &attr_isnull);
-	if (!attr_isnull)
+	valueDatum = heap_getattr(tuplePolicy,
+							  Anum_pg_policy_polqual,
+							  RelationGetDescr(pgPolicyRel),
+							  &attrIsnull);
+	if (!attrIsnull)
 	{
-		text	   *exprtext = DatumGetTextPP(value_datum);
-		text	   *using_expression = pg_get_expr_worker(exprtext,
-														  policyForm->polrelid, false);
+		text	   *exprtext = DatumGetTextPP(valueDatum);
+		text	   *usingExpression = pg_get_expr_worker(exprtext,
+														 policyForm->polrelid, false);
 
 		get_formatted_string(&buf, pretty, 1, "USING (%s)",
-							 text_to_cstring(using_expression));
+							 text_to_cstring(usingExpression));
 	}
 
 	/* Check if the policy has a WITH CHECK expr */
-	value_datum = heap_getattr(tuplePolicy,
-							   Anum_pg_policy_polwithcheck,
-							   RelationGetDescr(pgPolicyRel),
-							   &attr_isnull);
-	if (!attr_isnull)
+	valueDatum = heap_getattr(tuplePolicy,
+							  Anum_pg_policy_polwithcheck,
+							  RelationGetDescr(pgPolicyRel),
+							  &attrIsnull);
+	if (!attrIsnull)
 	{
-		text	   *exprtext = DatumGetTextPP(value_datum);
-		text	   *check_expression = pg_get_expr_worker(exprtext,
-														  policyForm->polrelid, false);
+		text	   *exprtext = DatumGetTextPP(valueDatum);
+		text	   *checkExpression = pg_get_expr_worker(exprtext,
+														 policyForm->polrelid, false);
 
 		get_formatted_string(&buf, pretty, 1, "WITH CHECK (%s)",
-							 text_to_cstring(check_expression));
+							 text_to_cstring(checkExpression));
 	}
 
 	appendStringInfoChar(&buf, ';');

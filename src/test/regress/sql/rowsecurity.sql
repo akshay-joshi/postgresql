@@ -2401,7 +2401,7 @@ drop function rls_f(text);
 drop table rls_t, test_t;
 
 --
--- Test for pg_get_policy_ddl(tableName, policyName, preety) function.
+-- Test for pg_get_policy_ddl(tableName, policyName, pretty) function.
 --
 CREATE TABLE rls_tbl_1 (
     did         int primary key,
@@ -2432,6 +2432,12 @@ CREATE POLICY rls_p7 ON rls_tbl_1 FOR DELETE USING (cid < 8);
 -- Test TO { role_name ... }
 CREATE POLICY rls_p8 ON rls_tbl_1 TO regress_rls_dave, regress_rls_alice USING (true);
 CREATE POLICY rls_p9 ON rls_tbl_1 TO regress_rls_exempt_user WITH CHECK (cid = (SELECT seclv FROM rls_tbl_2));
+
+-- Test NULL value
+SELECT pg_get_policy_ddl(NULL, 'rls_p1', false);
+SELECT pg_get_policy_ddl('tab1', NULL, false);
+SELECT pg_get_policy_ddl(NULL, NULL, false);
+
 
 -- Table does not exist
 SELECT pg_get_policy_ddl('tab1', 'rls_p1', false);
