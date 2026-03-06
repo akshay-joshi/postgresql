@@ -602,6 +602,7 @@ CycleCtr
 DBState
 DbOidName
 DCHCacheEntry
+DDLOptionDef
 DEADLOCK_INFO
 DECountItem
 DH

@@ -57,6 +57,7 @@
 #include "rewrite/rewriteHandler.h"
 #include "rewrite/rewriteManip.h"
 #include "rewrite/rewriteSupport.h"
+#include "utils/acl.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
@@ -547,7 +548,6 @@ static void get_json_table_nested_columns(TableFunc *tf, JsonTablePlan *plan,
 										  deparse_context *context,
 										  bool showimplicit,
 										  bool needcomma);
-
 #define only_marker(rte)  ((rte)->inh ? "" : "ONLY ")
 
 

@@ -98,6 +98,7 @@ backend_sources += files(
   'regproc.c',
   'ri_triggers.c',
   'rowtypes.c',
+  'ddlutils.c',
   'ruleutils.c',
   'selfuncs.c',
   'skipsupport.c',

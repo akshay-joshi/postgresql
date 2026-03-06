@@ -372,3 +372,9 @@ CREATE OR REPLACE FUNCTION ts_debug(document text,
 BEGIN ATOMIC
     SELECT * FROM ts_debug(get_current_ts_config(), $1);
 END;
+
+CREATE OR REPLACE FUNCTION
+  pg_get_database_ddl(database_id regdatabase, VARIADIC options "any" DEFAULT NULL)
+RETURNS text
+LANGUAGE internal
+AS 'pg_get_database_ddl';

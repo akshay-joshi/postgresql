@@ -3845,4 +3845,95 @@ acl      | {postgres=arwdDxtm/postgres,foo=r/postgres}
 
   </sect2>
 
+  <sect2 id="functions-get-object-ddl">
+   <title>Get Object DDL Functions</title>
+
+   <para>
+    The functions described in <xref linkend="functions-get-object-ddl-table"/>
+    return the Data Definition Language (DDL) statement for any given database object.
+    This feature is implemented as a set of distinct functions, one for each object type.
+   </para>
+
+   <table id="functions-get-object-ddl-table">
+    <title>Get Object DDL Functions</title>
+    <tgroup cols="1">
+     <thead>
+      <row>
+       <entry role="func_table_entry"><para role="func_signature">
+        Function
+       </para>
+       <para>
+        Description
+       </para></entry>
+      </row>
+     </thead>
+
+     <tbody>
+      <row>
+       <entry role="func_table_entry"><para role="func_signature">
+        <indexterm>
+         <primary>pg_get_database_ddl</primary>
+        </indexterm>
+        <function>pg_get_database_ddl</function>
+        ( <parameter>database_id</parameter> <type>regdatabase</type>
+        <optional>, <literal>VARIADIC</literal> <parameter>options</parameter>
+        <type>"any"</type> </optional> )
+        <returnvalue>text</returnvalue>
+       </para>
+       <para>
+        Reconstructs the <command>CREATE DATABASE</command> statement for the
+        specified database (identified by name or OID) from the system
+        catalogs. The optional variadic arguments are name/value pairs that
+        control the output
+        formatting and content (e.g., <literal>'pretty', true, 'owner', false</literal>).
+        Supported options are explained below.
+        </para></entry>
+      </row>
+     </tbody>
+    </tgroup>
+   </table>
+
+  <para>
+    The <parameter>options</parameter> for <function>pg_get_database_ddl</function>
+    provide fine-grained control over the generated SQL. Options are passed as
+    alternating key/value pairs where the key is a text string and the
+    value is either a boolean or a text string representing a boolean
+    (<literal>true</literal>, <literal>false</literal>, <literal>yes</literal>,
+    <literal>no</literal>, <literal>1</literal>, <literal>0</literal>,
+    <literal>on</literal>, <literal>off</literal>):
+    <itemizedlist>
+    <listitem>
+      <para>
+      <literal>'pretty', true</literal> (or <literal>'pretty', 'yes'</literal>):
+      Formats the output with newlines and indentation for better readability.
+      This option defaults to false.
+      </para>
+    </listitem>
+    <listitem>
+      <para>
+      <literal>'owner', false</literal> (or <literal>'owner', 'no'</literal>):
+      Omits the <literal>OWNER</literal> clause from the reconstructed statement.
+      This option defaults to true.
+      </para>
+    </listitem>
+    <listitem>
+      <para>
+      <literal>'tablespace', false</literal> (or <literal>'tablespace', '0'</literal>):
+      Omits the <literal>TABLESPACE</literal> clause from the reconstructed statement.
+      This option defaults to true.
+      </para>
+    </listitem>
+    <listitem>
+      <para>
+      <literal>'defaults', true</literal> (or <literal>'defaults', '1'</literal>):
+      Includes clauses for parameters that are currently at their default values
+      (e.g., <literal>CONNECTION LIMIT -1</literal>), which are normally omitted for brevity.
+      This option defaults to false.
+      </para>
+    </listitem>
+    </itemizedlist>
+  </para>
+
+  </sect2>
+
   </sect1>

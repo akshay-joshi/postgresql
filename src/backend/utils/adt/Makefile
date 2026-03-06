@@ -102,6 +102,7 @@ OBJS = \
 	regproc.o \
 	ri_triggers.o \
 	rowtypes.o \
+	ddlutils.o \
 	ruleutils.o \
 	selfuncs.o \
 	skipsupport.o \

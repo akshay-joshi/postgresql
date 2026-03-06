@@ -1,3 +1,65 @@
+--
+-- Reconstruct DDL
+--
+-- To produce stable regression test output, it's usually necessary to
+-- ignore collation and locale related details. This filter
+-- functions removes collation and locale related details.
+CREATE OR REPLACE FUNCTION ddl_filter(ddl_input TEXT)
+RETURNS TEXT AS $$
+DECLARE
+    cleaned_ddl TEXT;
+BEGIN
+    -- Remove %LOCALE_PROVIDER% placeholders
+    cleaned_ddl := regexp_replace(
+        ddl_input,
+        '\s*\mLOCALE_PROVIDER\M\s*=\s*([''"]?[^''"\s]+[''"]?)',
+        '',
+        'gi'
+    );
+
+    -- Remove LC_COLLATE assignments
+    cleaned_ddl := regexp_replace(
+        cleaned_ddl,
+        '\s*LC_COLLATE\s*=\s*([''"])[^''"]*\1',
+        '',
+        'gi'
+    );
+
+    -- Remove LC_CTYPE assignments
+    cleaned_ddl := regexp_replace(
+        cleaned_ddl,
+        '\s*LC_CTYPE\s*=\s*([''"])[^''"]*\1',
+        '',
+        'gi'
+    );
+
+    -- Remove %LOCALE% placeholders
+    cleaned_ddl := regexp_replace(
+        cleaned_ddl,
+        '\s*\S*LOCALE\S*\s*=?\s*([''"])[^''"]*\1',
+        '',
+        'gi'
+    );
+
+    -- Remove %COLLATION% placeholders
+    cleaned_ddl := regexp_replace(
+        cleaned_ddl,
+        '\s*\S*COLLATION\S*\s*=?\s*([''"])[^''"]*\1',
+        '',
+        'gi'
+    );
+
+    -- Remove ENCODING assignments
+    cleaned_ddl := regexp_replace(
+        cleaned_ddl,
+        '\s*ENCODING\s*=\s*([''"])[^''"]*\1',
+        '',
+        'gi'
+    );
+
+    RETURN cleaned_ddl;
+END;
+$$ LANGUAGE plpgsql;
 CREATE DATABASE regression_tbd
 	ENCODING utf8 LC_COLLATE "C" LC_CTYPE "C" TEMPLATE template0;
 ALTER DATABASE regression_tbd RENAME TO regression_utf8;
@@ -16,6 +78,130 @@ CREATE ROLE regress_datdba_before;
 CREATE ROLE regress_datdba_after;
 ALTER DATABASE regression_utf8 OWNER TO regress_datdba_before;
 REASSIGN OWNED BY regress_datdba_before TO regress_datdba_after;
+-- Test pg_get_database_ddl
+-- Database doesn't exists
+SELECT pg_get_database_ddl('regression_database');
+ERROR:  database "regression_database" does not exist
+LINE 1: SELECT pg_get_database_ddl('regression_database');
+                                   ^
+-- Test NULL value
+SELECT pg_get_database_ddl(NULL);
+ pg_get_database_ddl 
+---------------------
+ 
+(1 row)
+
+-- Without options
+SELECT ddl_filter(pg_get_database_ddl('regression_utf8'));
+                                        ddl_filter                                         
+-------------------------------------------------------------------------------------------
+ CREATE DATABASE regression_utf8 WITH OWNER = regress_datdba_after CONNECTION LIMIT = 123;
+(1 row)
+
+-- With No Owner
+SELECT ddl_filter(pg_get_database_ddl('regression_utf8', 'owner', false));
+                          ddl_filter                          
+--------------------------------------------------------------
+ CREATE DATABASE regression_utf8 WITH CONNECTION LIMIT = 123;
+(1 row)
+
+-- With No Tablespace
+SELECT ddl_filter(pg_get_database_ddl('regression_utf8', 'defaults', true, 'tablespace', false));
+                                                               ddl_filter                                                               
+----------------------------------------------------------------------------------------------------------------------------------------
+ CREATE DATABASE regression_utf8 WITH OWNER = regress_datdba_after ALLOW_CONNECTIONS = true CONNECTION LIMIT = 123 IS_TEMPLATE = false;
+(1 row)
+
+-- With Defaults
+SELECT ddl_filter(pg_get_database_ddl('regression_utf8', 'defaults', true));
+                                                                           ddl_filter                                                                           
+----------------------------------------------------------------------------------------------------------------------------------------------------------------
+ CREATE DATABASE regression_utf8 WITH OWNER = regress_datdba_after TABLESPACE = pg_default ALLOW_CONNECTIONS = true CONNECTION LIMIT = 123 IS_TEMPLATE = false;
+(1 row)
+
+-- With No Owner, No Tablespace and With Defaults
+SELECT ddl_filter(pg_get_database_ddl('regression_utf8', 'owner', false, 'tablespace', false, 'defaults', true));
+                                                ddl_filter                                                 
+-----------------------------------------------------------------------------------------------------------
+ CREATE DATABASE regression_utf8 WITH ALLOW_CONNECTIONS = true CONNECTION LIMIT = 123 IS_TEMPLATE = false;
+(1 row)
+
+-- With Pretty formatted
+\pset format unaligned
+SELECT ddl_filter(pg_get_database_ddl('regression_utf8', 'pretty', true));
+ddl_filter
+CREATE DATABASE regression_utf8
+    WITH
+        OWNER = regress_datdba_after
+        CONNECTION LIMIT = 123;
+(1 row)
+-- With No Owner and No Tablespace
+SELECT ddl_filter(pg_get_database_ddl('regression_utf8', 'pretty', true, 'owner', false, 'tablespace', false));
+ddl_filter
+CREATE DATABASE regression_utf8
+    WITH
+        CONNECTION LIMIT = 123;
+(1 row)
+-- With Defaults
+SELECT ddl_filter(pg_get_database_ddl('regression_utf8', 'pretty', true, 'defaults', true));
+ddl_filter
+CREATE DATABASE regression_utf8
+    WITH
+        OWNER = regress_datdba_after
+        TABLESPACE = pg_default
+        ALLOW_CONNECTIONS = true
+        CONNECTION LIMIT = 123
+        IS_TEMPLATE = false;
+(1 row)
+-- With No Owner, No Tablespace and With Defaults
+SELECT ddl_filter(pg_get_database_ddl('regression_utf8', 'pretty', true, 'owner', false, 'tablespace', false, 'defaults', true));
+ddl_filter
+CREATE DATABASE regression_utf8
+    WITH
+        ALLOW_CONNECTIONS = true
+        CONNECTION LIMIT = 123
+        IS_TEMPLATE = false;
+(1 row)
+-- Test with text values: 'yes', 'no', '1', '0', 'on', 'off'
+\pset format aligned
+-- Using 'yes' and 'no'
+SELECT ddl_filter(pg_get_database_ddl('regression_utf8', 'owner', 'no', 'defaults', 'yes'));
+                                                            ddl_filter                                                             
+-----------------------------------------------------------------------------------------------------------------------------------
+ CREATE DATABASE regression_utf8 WITH TABLESPACE = pg_default ALLOW_CONNECTIONS = true CONNECTION LIMIT = 123 IS_TEMPLATE = false;
+(1 row)
+
+-- Using '1' and '0'
+SELECT ddl_filter(pg_get_database_ddl('regression_utf8', 'owner', '0', 'tablespace', '0', 'defaults', '1'));
+                                                ddl_filter                                                 
+-----------------------------------------------------------------------------------------------------------
+ CREATE DATABASE regression_utf8 WITH ALLOW_CONNECTIONS = true CONNECTION LIMIT = 123 IS_TEMPLATE = false;
+(1 row)
+
+-- Using 'on' and 'off'
+SELECT ddl_filter(pg_get_database_ddl('regression_utf8', 'owner', 'off', 'pretty', 'on'));
+           ddl_filter            
+---------------------------------
+ CREATE DATABASE regression_utf8+
+     WITH                       +
+         CONNECTION LIMIT = 123;
+(1 row)
+
+-- Mixed boolean and text values
+SELECT ddl_filter(pg_get_database_ddl('regression_utf8', 'owner', false, 'defaults', 'true', 'tablespace', 'no'));
+                                                ddl_filter                                                 
+-----------------------------------------------------------------------------------------------------------
+ CREATE DATABASE regression_utf8 WITH ALLOW_CONNECTIONS = true CONNECTION LIMIT = 123 IS_TEMPLATE = false;
+(1 row)
+
+-- Test duplicate option (should error)
+SELECT pg_get_database_ddl('regression_utf8', 'owner', false, 'owner', true);
+ERROR:  option "owner" is specified more than once
+-- Test invalid text value (should error)
+SELECT pg_get_database_ddl('regression_utf8', 'owner', 'invalid');
+ERROR:  value for option "owner" at position 2 has invalid value "invalid"
+HINT:  Valid values are: true, false, yes, no, 1, 0, on, off.
 DROP DATABASE regression_utf8;
+DROP FUNCTION ddl_filter(text);
 DROP ROLE regress_datdba_before;
 DROP ROLE regress_datdba_after;
