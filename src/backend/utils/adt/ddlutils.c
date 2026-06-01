@@ -21,12 +21,29 @@
 #include "access/genam.h"
 #include "access/htup_details.h"
 #include "access/table.h"
+#include "access/toast_compression.h"
 #include "catalog/pg_auth_members.h"
 #include "catalog/pg_authid.h"
+#include "catalog/pg_attrdef.h"
+#include "catalog/pg_class.h"
+#include "catalog/dependency.h"
 #include "catalog/pg_collation.h"
+#include "catalog/pg_constraint.h"
 #include "catalog/pg_database.h"
 #include "catalog/pg_db_role_setting.h"
+#include "catalog/pg_am.h"
+#include "catalog/pg_index.h"
+#include "catalog/pg_inherits.h"
+#include "catalog/pg_policy.h"
+#include "catalog/pg_sequence.h"
+#include "catalog/pg_statistic_ext.h"
 #include "catalog/pg_tablespace.h"
+#include "catalog/pg_trigger.h"
+#include "catalog/partition.h"
+#include "commands/defrem.h"
+#include "rewrite/prs2lock.h"
+#include "nodes/nodes.h"
+#include "nodes/readfuncs.h"
 #include "commands/tablespace.h"
 #include "common/relpath.h"
 #include "funcapi.h"
@@ -86,6 +103,10 @@ static List *pg_get_tablespace_ddl_internal(Oid tsid, bool pretty, bool no_owner
 static Datum pg_get_tablespace_ddl_srf(FunctionCallInfo fcinfo, Oid tsid, bool isnull);
 static List *pg_get_database_ddl_internal(Oid dbid, bool pretty,
 										  bool no_owner, bool no_tablespace);
+static List *pg_get_table_ddl_internal(Oid relid, bool pretty,
+									   bool no_owner, bool no_tablespace);
+static void append_column_defs(StringInfo buf, Relation rel, bool pretty);
+static List *get_inheritance_parents(Oid relid);
 
 
 /*
@@ -1162,6 +1183,969 @@ pg_get_database_ddl(PG_FUNCTION_ARGS)
 												  opts[0].isset && opts[0].boolval,
 												  opts[1].isset && !opts[1].boolval,
 												  opts[2].isset && !opts[2].boolval);
+		funcctx->user_fctx = statements;
+		funcctx->max_calls = list_length(statements);
+
+		MemoryContextSwitchTo(oldcontext);
+	}
+
+	funcctx = SRF_PERCALL_SETUP();
+	statements = (List *) funcctx->user_fctx;
+
+	if (funcctx->call_cntr < funcctx->max_calls)
+	{
+		char	   *stmt;
+
+		stmt = list_nth(statements, funcctx->call_cntr);
+
+		SRF_RETURN_NEXT(funcctx, CStringGetTextDatum(stmt));
+	}
+	else
+	{
+		list_free_deep(statements);
+		SRF_RETURN_DONE(funcctx);
+	}
+}
+
+/*
+ * get_inheritance_parents
+ *		Return a List of parent OIDs for relid, ordered by inhseqno.
+ *
+ * find_inheritance_children() walks the opposite direction (parent->children),
+ * so we scan pg_inherits directly here using the (inhrelid, inhseqno) index,
+ * which yields rows in the order they need to appear in the INHERITS clause.
+ * Partition children also have a pg_inherits entry, so callers must skip the
+ * INHERITS clause when relispartition is true.
+ */
+static List *
+get_inheritance_parents(Oid relid)
+{
+	Relation	inheritsRel;
+	SysScanDesc scan;
+	ScanKeyData key;
+	HeapTuple	tup;
+	List	   *parents = NIL;
+
+	inheritsRel = table_open(InheritsRelationId, AccessShareLock);
+	ScanKeyInit(&key,
+				Anum_pg_inherits_inhrelid,
+				BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(relid));
+	scan = systable_beginscan(inheritsRel, InheritsRelidSeqnoIndexId,
+							  true, NULL, 1, &key);
+	while (HeapTupleIsValid(tup = systable_getnext(scan)))
+	{
+		Form_pg_inherits inh = (Form_pg_inherits) GETSTRUCT(tup);
+
+		parents = lappend_oid(parents, inh->inhparent);
+	}
+	systable_endscan(scan);
+	table_close(inheritsRel, AccessShareLock);
+
+	return parents;
+}
+
+/*
+ * append_column_defs
+ *		Append the comma-separated column definition list for a table.
+ *
+ * Emits each non-dropped, locally-declared column as
+ *		name type [COLLATE x] [STORAGE s] [COMPRESSION c]
+ *		[GENERATED ... | DEFAULT e] [NOT NULL]
+ * followed by any locally-declared inline CHECK constraints.  Optional
+ * clauses are omitted when their value matches what the system would
+ * reapply on round-trip (e.g. type-default COLLATE, type-default STORAGE).
+ */
+static void
+append_column_defs(StringInfo buf, Relation rel, bool pretty)
+{
+	TupleDesc	tupdesc = RelationGetDescr(rel);
+	TupleConstr *constr = tupdesc->constr;
+	List	   *dpcontext = NIL;
+	bool		first = true;
+
+	for (int i = 0; i < tupdesc->natts; i++)
+	{
+		Form_pg_attribute att = TupleDescAttr(tupdesc, i);
+		char	   *typstr;
+
+		if (att->attisdropped)
+			continue;
+
+		/*
+		 * Columns inherited from a parent are emitted by the INHERITS clause
+		 * (once implemented), not the column list, unless the child
+		 * redeclared them locally (attislocal=true).
+		 */
+		if (!att->attislocal)
+			continue;
+
+		if (!first)
+			appendStringInfoChar(buf, ',');
+		first = false;
+
+		if (pretty)
+			appendStringInfoString(buf, "\n    ");
+		else
+			appendStringInfoChar(buf, ' ');
+
+		appendStringInfoString(buf, quote_identifier(NameStr(att->attname)));
+		appendStringInfoChar(buf, ' ');
+
+		typstr = format_type_with_typemod(att->atttypid, att->atttypmod);
+		appendStringInfoString(buf, typstr);
+		pfree(typstr);
+
+		/* COLLATE clause, only if it differs from the type's default. */
+		if (OidIsValid(att->attcollation) &&
+			att->attcollation != get_typcollation(att->atttypid))
+			appendStringInfo(buf, " COLLATE %s",
+							 generate_collation_name(att->attcollation));
+
+		/* STORAGE clause, only if it differs from the type's default. */
+		if (att->attstorage != get_typstorage(att->atttypid))
+		{
+			const char *storage = NULL;
+
+			switch (att->attstorage)
+			{
+				case TYPSTORAGE_PLAIN:
+					storage = "PLAIN";
+					break;
+				case TYPSTORAGE_EXTERNAL:
+					storage = "EXTERNAL";
+					break;
+				case TYPSTORAGE_MAIN:
+					storage = "MAIN";
+					break;
+				case TYPSTORAGE_EXTENDED:
+					storage = "EXTENDED";
+					break;
+			}
+			if (storage)
+				appendStringInfo(buf, " STORAGE %s", storage);
+		}
+
+		/* COMPRESSION clause, only if explicitly set on the column. */
+		if (CompressionMethodIsValid(att->attcompression))
+		{
+			const char *cm = NULL;
+
+			switch (att->attcompression)
+			{
+				case TOAST_PGLZ_COMPRESSION:
+					cm = "pglz";
+					break;
+				case TOAST_LZ4_COMPRESSION:
+					cm = "lz4";
+					break;
+			}
+			if (cm)
+				appendStringInfo(buf, " COMPRESSION %s", cm);
+		}
+
+		/*
+		 * Look up the default/generated expression text up front; generated
+		 * columns have atthasdef=true with an entry in pg_attrdef just like
+		 * regular defaults.
+		 */
+		{
+			const char *defexpr = NULL;
+
+			if (att->atthasdef && constr != NULL)
+			{
+				for (int j = 0; j < constr->num_defval; j++)
+				{
+					if (constr->defval[j].adnum != att->attnum)
+						continue;
+
+					if (dpcontext == NIL)
+						dpcontext = deparse_context_for(RelationGetRelationName(rel),
+														RelationGetRelid(rel));
+
+					defexpr = deparse_expression(stringToNode(constr->defval[j].adbin),
+												 dpcontext, false, false);
+					break;
+				}
+			}
+
+			/* GENERATED / IDENTITY / DEFAULT are mutually exclusive. */
+			if (att->attgenerated == ATTRIBUTE_GENERATED_STORED && defexpr)
+				appendStringInfo(buf, " GENERATED ALWAYS AS (%s) STORED", defexpr);
+			else if (att->attgenerated == ATTRIBUTE_GENERATED_VIRTUAL && defexpr)
+				appendStringInfo(buf, " GENERATED ALWAYS AS (%s) VIRTUAL", defexpr);
+			else if (att->attidentity == ATTRIBUTE_IDENTITY_ALWAYS ||
+					 att->attidentity == ATTRIBUTE_IDENTITY_BY_DEFAULT)
+			{
+				const char *idkind =
+					(att->attidentity == ATTRIBUTE_IDENTITY_ALWAYS)
+					? "ALWAYS" : "BY DEFAULT";
+				Oid			seqid = getIdentitySequence(rel, att->attnum, true);
+
+				appendStringInfo(buf, " GENERATED %s AS IDENTITY", idkind);
+
+				/*
+				 * Emit only the sequence options that differ from their
+				 * defaults — mirroring pg_get_database_ddl's pattern of
+				 * omitting values that the system would reapply on its own.
+				 */
+				if (OidIsValid(seqid))
+				{
+					HeapTuple	seqTup = SearchSysCache1(SEQRELID,
+														 ObjectIdGetDatum(seqid));
+
+					if (HeapTupleIsValid(seqTup))
+					{
+						Form_pg_sequence seq = (Form_pg_sequence) GETSTRUCT(seqTup);
+						StringInfoData opts;
+						bool		first_opt = true;
+						int64		def_min,
+									def_max,
+									def_start;
+						int64		typ_min,
+									typ_max;
+
+						/*
+						 * Per-type bounds for the sequence's underlying
+						 * integer type.  Defaults to int8 if the column type
+						 * is something else (shouldn't happen for IDENTITY,
+						 * but be defensive).
+						 */
+						switch (att->atttypid)
+						{
+							case INT2OID:
+								typ_min = PG_INT16_MIN;
+								typ_max = PG_INT16_MAX;
+								break;
+							case INT4OID:
+								typ_min = PG_INT32_MIN;
+								typ_max = PG_INT32_MAX;
+								break;
+							default:
+								typ_min = PG_INT64_MIN;
+								typ_max = PG_INT64_MAX;
+								break;
+						}
+
+						if (seq->seqincrement > 0)
+						{
+							def_min = 1;
+							def_max = typ_max;
+							def_start = def_min;
+						}
+						else
+						{
+							def_min = typ_min;
+							def_max = -1;
+							def_start = def_max;
+						}
+
+						initStringInfo(&opts);
+
+						/*
+						 * SEQUENCE NAME — omit when it matches the
+						 * implicit "<tablename>_<columnname>_seq" pattern
+						 * in the same schema, since CREATE TABLE will
+						 * regenerate that exact name.
+						 */
+						{
+							const char *seqname = get_rel_name(seqid);
+							Oid			seqnsp = get_rel_namespace(seqid);
+							char		autoname[NAMEDATALEN];
+
+							snprintf(autoname, sizeof(autoname), "%s_%s_seq",
+									 RelationGetRelationName(rel),
+									 NameStr(att->attname));
+							if (seqnsp != RelationGetNamespace(rel) ||
+								strcmp(seqname, autoname) != 0)
+							{
+								appendStringInfo(&opts, "%sSEQUENCE NAME %s",
+												 first_opt ? "" : " ",
+												 quote_qualified_identifier(get_namespace_name(seqnsp),
+																			seqname));
+								first_opt = false;
+							}
+						}
+
+						if (seq->seqstart != def_start)
+						{
+							appendStringInfo(&opts, "%sSTART WITH " INT64_FORMAT,
+											 first_opt ? "" : " ", seq->seqstart);
+							first_opt = false;
+						}
+						if (seq->seqincrement != 1)
+						{
+							appendStringInfo(&opts, "%sINCREMENT BY " INT64_FORMAT,
+											 first_opt ? "" : " ", seq->seqincrement);
+							first_opt = false;
+						}
+						if (seq->seqmin != def_min)
+						{
+							appendStringInfo(&opts, "%sMINVALUE " INT64_FORMAT,
+											 first_opt ? "" : " ", seq->seqmin);
+							first_opt = false;
+						}
+						if (seq->seqmax != def_max)
+						{
+							appendStringInfo(&opts, "%sMAXVALUE " INT64_FORMAT,
+											 first_opt ? "" : " ", seq->seqmax);
+							first_opt = false;
+						}
+						if (seq->seqcache != 1)
+						{
+							appendStringInfo(&opts, "%sCACHE " INT64_FORMAT,
+											 first_opt ? "" : " ", seq->seqcache);
+							first_opt = false;
+						}
+						if (seq->seqcycle)
+						{
+							appendStringInfo(&opts, "%sCYCLE", first_opt ? "" : " ");
+							first_opt = false;
+						}
+
+						if (!first_opt)
+							appendStringInfo(buf, " (%s)", opts.data);
+
+						pfree(opts.data);
+						ReleaseSysCache(seqTup);
+					}
+				}
+			}
+			else if (defexpr)
+				appendStringInfo(buf, " DEFAULT %s", defexpr);
+		}
+
+		if (att->attnotnull)
+			appendStringInfoString(buf, " NOT NULL");
+	}
+
+	/*
+	 * Table-level CHECK constraints — emitted inline in the CREATE TABLE
+	 * body so they appear alongside the columns (the pg_dump shape).  The
+	 * constraint loop later in pg_get_table_ddl_internal skips CHECK
+	 * constraints to avoid double-emission.  Inherited CHECK constraints
+	 * (!conislocal) come from the parent's DDL and aren't repeated here.
+	 */
+	{
+		Relation	conRel;
+		SysScanDesc conScan;
+		ScanKeyData conKey;
+		HeapTuple	conTup;
+
+		conRel = table_open(ConstraintRelationId, AccessShareLock);
+		ScanKeyInit(&conKey,
+					Anum_pg_constraint_conrelid,
+					BTEqualStrategyNumber, F_OIDEQ,
+					ObjectIdGetDatum(RelationGetRelid(rel)));
+		conScan = systable_beginscan(conRel, ConstraintRelidTypidNameIndexId,
+									 true, NULL, 1, &conKey);
+
+		while (HeapTupleIsValid(conTup = systable_getnext(conScan)))
+		{
+			Form_pg_constraint con = (Form_pg_constraint) GETSTRUCT(conTup);
+			Datum		defDatum;
+			char	   *defbody;
+
+			if (con->contype != CONSTRAINT_CHECK)
+				continue;
+			if (!con->conislocal)
+				continue;
+
+			if (!first)
+				appendStringInfoChar(buf, ',');
+			first = false;
+			if (pretty)
+				appendStringInfoString(buf, "\n    ");
+			else
+				appendStringInfoChar(buf, ' ');
+
+			defDatum = OidFunctionCall1(F_PG_GET_CONSTRAINTDEF_OID,
+										ObjectIdGetDatum(con->oid));
+			defbody = TextDatumGetCString(defDatum);
+			appendStringInfo(buf, "CONSTRAINT %s %s",
+							 quote_identifier(NameStr(con->conname)),
+							 defbody);
+			pfree(defbody);
+		}
+		systable_endscan(conScan);
+		table_close(conRel, AccessShareLock);
+	}
+}
+
+/*
+ * pg_get_table_ddl_internal
+ *		Generate DDL statements to recreate a regular or partitioned table.
+ *
+ * The first list element is the CREATE TABLE statement.  Subsequent
+ * elements are the ALTER TABLE / CREATE INDEX / CREATE RULE /
+ * CREATE STATISTICS statements needed to restore the table's full
+ * definition.
+ *
+ * Trigger and policy emission are scaffolded but not yet wired up — they
+ * are gated on standalone pg_get_trigger_ddl / pg_get_policy_ddl helpers
+ * landing.
+ */
+static List *
+pg_get_table_ddl_internal(Oid relid, bool pretty,
+						  bool no_owner, bool no_tablespace)
+{
+	Relation	rel;
+	StringInfoData buf;
+	List	   *statements = NIL;
+	const char *qualname;
+	char		relkind;
+	AclResult	aclresult;
+
+	rel = table_open(relid, AccessShareLock);
+
+	relkind = rel->rd_rel->relkind;
+
+	/*
+	 * The initial cut only supports ordinary and partitioned tables.  Views,
+	 * matviews, foreign tables, sequences, indexes, composite types, and
+	 * TOAST tables are out of scope for now.
+	 */
+	if (relkind != RELKIND_RELATION && relkind != RELKIND_PARTITIONED_TABLE)
+	{
+		char	   *relname = pstrdup(RelationGetRelationName(rel));
+
+		table_close(rel, AccessShareLock);
+		ereport(ERROR,
+				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				 errmsg("\"%s\" is not an ordinary or partitioned table",
+						relname)));
+	}
+
+	/* Caller needs SELECT on the table to read its definition. */
+	aclresult = pg_class_aclcheck(relid, GetUserId(), ACL_SELECT);
+	if (aclresult != ACLCHECK_OK)
+		aclcheck_error(aclresult, OBJECT_TABLE,
+					   RelationGetRelationName(rel));
+
+	qualname = quote_qualified_identifier(get_namespace_name(RelationGetNamespace(rel)),
+										  RelationGetRelationName(rel));
+
+	initStringInfo(&buf);
+
+	/* pg_class tuple — for relpartbound and reloptions */
+	{
+		HeapTuple	classtup;
+		Datum		reloptDatum;
+		bool		reloptIsnull;
+
+		classtup = SearchSysCache1(RELOID, ObjectIdGetDatum(relid));
+		if (!HeapTupleIsValid(classtup))
+			elog(ERROR, "cache lookup failed for relation %u", relid);
+
+		reloptDatum = SysCacheGetAttr(RELOID, classtup,
+									  Anum_pg_class_reloptions, &reloptIsnull);
+
+		if (rel->rd_rel->relispartition)
+		{
+			/* Partition child: CREATE TABLE child PARTITION OF parent FOR VALUES ... */
+			Oid			parentOid = get_partition_parent(relid, true);
+			const char *parentQual =
+				quote_qualified_identifier(get_namespace_name(get_rel_namespace(parentOid)),
+										   get_rel_name(parentOid));
+			Datum		boundDatum;
+			bool		boundIsnull;
+			char	   *forValues = "DEFAULT";
+
+			boundDatum = SysCacheGetAttr(RELOID, classtup,
+										 Anum_pg_class_relpartbound, &boundIsnull);
+			if (!boundIsnull)
+			{
+				Node	   *boundNode = stringToNode(TextDatumGetCString(boundDatum));
+				List	   *dpcontext =
+					deparse_context_for(get_rel_name(parentOid), parentOid);
+
+				forValues = deparse_expression(boundNode, dpcontext, false, false);
+			}
+
+			appendStringInfo(&buf, "CREATE TABLE %s PARTITION OF %s %s",
+							 qualname, parentQual, forValues);
+
+			/*
+			 * Column-level overrides redeclared on the child are emitted
+			 * out-of-line: NOT NULL/CHECK come through the constraint loop
+			 * (conislocal=true), and DEFAULT comes through the dedicated
+			 * ALTER COLUMN SET DEFAULT pass below.
+			 */
+		}
+		else
+		{
+			List	   *parents;
+			ListCell   *lc;
+			bool		first;
+
+			/* CREATE [UNLOGGED] TABLE qualified_name ( */
+			appendStringInfoString(&buf, "CREATE ");
+			if (rel->rd_rel->relpersistence == RELPERSISTENCE_UNLOGGED)
+				appendStringInfoString(&buf, "UNLOGGED ");
+			appendStringInfo(&buf, "TABLE %s (", qualname);
+
+			append_column_defs(&buf, rel, pretty);
+
+			if (pretty)
+				appendStringInfoString(&buf, "\n)");
+			else
+				appendStringInfoChar(&buf, ')');
+
+			/* INHERITS (parent1, parent2, ...) — non-partition inheritance only */
+			parents = get_inheritance_parents(relid);
+			if (parents != NIL)
+			{
+				appendStringInfoString(&buf, " INHERITS (");
+				first = true;
+				foreach(lc, parents)
+				{
+					Oid			poid = lfirst_oid(lc);
+
+					if (!first)
+						appendStringInfoString(&buf, ", ");
+					first = false;
+					appendStringInfoString(&buf,
+										   quote_qualified_identifier(get_namespace_name(get_rel_namespace(poid)),
+																	  get_rel_name(poid)));
+				}
+				appendStringInfoChar(&buf, ')');
+				list_free(parents);
+			}
+		}
+
+		/* PARTITION BY — applies whenever this relation is a partitioned table */
+		if (relkind == RELKIND_PARTITIONED_TABLE)
+		{
+			Datum		partkeyDatum;
+			char	   *partkey;
+
+			partkeyDatum = OidFunctionCall1(F_PG_GET_PARTKEYDEF,
+											ObjectIdGetDatum(relid));
+			partkey = TextDatumGetCString(partkeyDatum);
+			appendStringInfo(&buf, " PARTITION BY %s", partkey);
+			pfree(partkey);
+		}
+
+		/*
+		 * USING method — emit only when the table access method differs
+		 * from heap (the cluster default).  Pluggable table AMs have been
+		 * supported since PostgreSQL 12.
+		 */
+		if (OidIsValid(rel->rd_rel->relam) &&
+			rel->rd_rel->relam != HEAP_TABLE_AM_OID)
+		{
+			char	   *amname = get_am_name(rel->rd_rel->relam);
+
+			if (amname != NULL)
+			{
+				appendStringInfo(&buf, " USING %s", quote_identifier(amname));
+				pfree(amname);
+			}
+		}
+
+		/* WITH (reloptions) */
+		if (!reloptIsnull)
+		{
+			appendStringInfoString(&buf, " WITH (");
+			get_reloptions(&buf, reloptDatum);
+			appendStringInfoChar(&buf, ')');
+		}
+
+		ReleaseSysCache(classtup);
+	}
+
+	/* TABLESPACE */
+	if (!no_tablespace && OidIsValid(rel->rd_rel->reltablespace))
+	{
+		char	   *tsname = get_tablespace_name(rel->rd_rel->reltablespace);
+
+		if (tsname != NULL)
+		{
+			appendStringInfo(&buf, " TABLESPACE %s", quote_identifier(tsname));
+			pfree(tsname);
+		}
+	}
+
+	appendStringInfoChar(&buf, ';');
+	statements = lappend(statements, pstrdup(buf.data));
+
+	/* OWNER */
+	if (!no_owner)
+	{
+		char	   *owner = GetUserNameFromId(rel->rd_rel->relowner, false);
+
+		resetStringInfo(&buf);
+		appendStringInfo(&buf, "ALTER TABLE %s OWNER TO %s;",
+						 qualname, quote_identifier(owner));
+		statements = lappend(statements, pstrdup(buf.data));
+		pfree(owner);
+	}
+
+	/*
+	 * Per-column DEFAULT overrides on inherited/partition children.  The
+	 * column list inside CREATE TABLE only emits locally-declared columns
+	 * (attislocal=true), so any default set locally on a column that came
+	 * from a parent table needs to be re-applied with ALTER COLUMN SET
+	 * DEFAULT.  Note: NOT NULL overrides come out through the constraint
+	 * loop (PG 18 stores them as named pg_constraint entries with
+	 * conislocal=true), and CHECK overrides do too.
+	 */
+	{
+		TupleDesc	tupdesc = RelationGetDescr(rel);
+		TupleConstr *constr = tupdesc->constr;
+		List	   *dpcontext = NIL;
+
+		if (constr != NULL)
+		{
+			for (int j = 0; j < constr->num_defval; j++)
+			{
+				AttrDefault *defval = &constr->defval[j];
+				Form_pg_attribute att = TupleDescAttr(tupdesc, defval->adnum - 1);
+				char	   *defstr;
+
+				if (att->attislocal)
+					continue;		/* emitted inline by append_column_defs */
+
+				if (dpcontext == NIL)
+					dpcontext = deparse_context_for(RelationGetRelationName(rel),
+													RelationGetRelid(rel));
+				defstr = deparse_expression(stringToNode(defval->adbin),
+											dpcontext, false, false);
+
+				resetStringInfo(&buf);
+				appendStringInfo(&buf,
+								 "ALTER TABLE %s ALTER COLUMN %s SET DEFAULT %s;",
+								 qualname,
+								 quote_identifier(NameStr(att->attname)),
+								 defstr);
+				statements = lappend(statements, pstrdup(buf.data));
+			}
+		}
+	}
+
+	/*
+	 * Per-column attoptions — these can't be set inline in CREATE TABLE,
+	 * so they come out as ALTER TABLE ... ALTER COLUMN col SET (...) after
+	 * the table is created.  Typical use: n_distinct overrides for the
+	 * planner.
+	 */
+	{
+		TupleDesc	tupdesc = RelationGetDescr(rel);
+
+		for (int i = 0; i < tupdesc->natts; i++)
+		{
+			Form_pg_attribute att = TupleDescAttr(tupdesc, i);
+			HeapTuple	attTup;
+			Datum		optDatum;
+			bool		optIsnull;
+
+			if (att->attisdropped)
+				continue;
+
+			attTup = SearchSysCache2(ATTNUM,
+									 ObjectIdGetDatum(relid),
+									 Int16GetDatum(att->attnum));
+			if (!HeapTupleIsValid(attTup))
+				continue;
+
+			optDatum = SysCacheGetAttr(ATTNUM, attTup,
+									   Anum_pg_attribute_attoptions, &optIsnull);
+			if (!optIsnull)
+			{
+				resetStringInfo(&buf);
+				appendStringInfo(&buf, "ALTER TABLE %s ALTER COLUMN %s SET (",
+								 qualname,
+								 quote_identifier(NameStr(att->attname)));
+				get_reloptions(&buf, optDatum);
+				appendStringInfoString(&buf, ");");
+				statements = lappend(statements, pstrdup(buf.data));
+			}
+			ReleaseSysCache(attTup);
+		}
+	}
+
+	/*
+	 * Indexes — emit a CREATE INDEX for each non-constraint-backed index on
+	 * the table.  Indexes that back PK/UNIQUE/EXCLUDE constraints are
+	 * emitted by the constraint loop below as part of the ALTER TABLE ...
+	 * ADD CONSTRAINT statement, which creates the index implicitly.
+	 */
+	{
+		List	   *indexoids = RelationGetIndexList(rel);
+		ListCell   *lc;
+
+		foreach(lc, indexoids)
+		{
+			Oid			idxoid = lfirst_oid(lc);
+			char	   *idxdef;
+
+			if (OidIsValid(get_index_constraint(idxoid)))
+				continue;
+
+			idxdef = pg_get_indexdef_string(idxoid);
+			resetStringInfo(&buf);
+			appendStringInfo(&buf, "%s;", idxdef);
+			statements = lappend(statements, pstrdup(buf.data));
+			pfree(idxdef);
+		}
+		list_free(indexoids);
+	}
+
+	/*
+	 * Constraints — emit an ALTER TABLE ... ADD CONSTRAINT for each
+	 * locally-defined constraint on the table.  Inherited constraints
+	 * (conislocal=false) are produced by the parent's DDL and propagated
+	 * automatically by INHERITS / PARTITION OF, so we skip them here.
+	 */
+	{
+		Relation	conRel;
+		SysScanDesc conScan;
+		ScanKeyData conKey;
+		HeapTuple	conTup;
+
+		conRel = table_open(ConstraintRelationId, AccessShareLock);
+		ScanKeyInit(&conKey,
+					Anum_pg_constraint_conrelid,
+					BTEqualStrategyNumber, F_OIDEQ,
+					ObjectIdGetDatum(relid));
+		conScan = systable_beginscan(conRel, ConstraintRelidTypidNameIndexId,
+									 true, NULL, 1, &conKey);
+
+		while (HeapTupleIsValid(conTup = systable_getnext(conScan)))
+		{
+			Form_pg_constraint con = (Form_pg_constraint) GETSTRUCT(conTup);
+			char	   *condef;
+
+			if (!con->conislocal)
+				continue;
+			/* CHECK constraints are emitted inline in the column list. */
+			if (con->contype == CONSTRAINT_CHECK)
+				continue;
+
+			condef = pg_get_constraintdef_command(con->oid);
+			resetStringInfo(&buf);
+			appendStringInfo(&buf, "%s;", condef);
+			statements = lappend(statements, pstrdup(buf.data));
+			pfree(condef);
+		}
+		systable_endscan(conScan);
+		table_close(conRel, AccessShareLock);
+	}
+
+	/*
+	 * Rules — emit a CREATE RULE for each cached rewrite rule on the
+	 * relation.  Internal rules (such as the _RETURN rule on views) live on
+	 * views/matviews and don't appear here because we already restricted
+	 * relkind above.
+	 */
+	if (rel->rd_rules != NULL)
+	{
+		for (int i = 0; i < rel->rd_rules->numLocks; i++)
+		{
+			Oid			ruleid = rel->rd_rules->rules[i]->ruleId;
+			Datum		ruledef;
+
+			ruledef = OidFunctionCall1(F_PG_GET_RULEDEF_OID,
+									   ObjectIdGetDatum(ruleid));
+			resetStringInfo(&buf);
+			appendStringInfoString(&buf, TextDatumGetCString(ruledef));
+			statements = lappend(statements, pstrdup(buf.data));
+		}
+	}
+
+	/*
+	 * Extended statistics — iterate pg_statistic_ext by stxrelid and emit
+	 * pg_get_statisticsobjdef_string() for each.
+	 */
+	{
+		Relation	statRel;
+		SysScanDesc statScan;
+		ScanKeyData statKey;
+		HeapTuple	statTup;
+
+		statRel = table_open(StatisticExtRelationId, AccessShareLock);
+		ScanKeyInit(&statKey,
+					Anum_pg_statistic_ext_stxrelid,
+					BTEqualStrategyNumber, F_OIDEQ,
+					ObjectIdGetDatum(relid));
+		statScan = systable_beginscan(statRel, StatisticExtRelidIndexId,
+									  true, NULL, 1, &statKey);
+
+		while (HeapTupleIsValid(statTup = systable_getnext(statScan)))
+		{
+			Form_pg_statistic_ext stat = (Form_pg_statistic_ext) GETSTRUCT(statTup);
+			char	   *statdef = pg_get_statisticsobjdef_string(stat->oid);
+
+			resetStringInfo(&buf);
+			appendStringInfo(&buf, "%s;", statdef);
+			statements = lappend(statements, pstrdup(buf.data));
+			pfree(statdef);
+		}
+		systable_endscan(statScan);
+		table_close(statRel, AccessShareLock);
+	}
+
+	/*
+	 * REPLICA IDENTITY — emit only when it differs from the default
+	 * ('d' = use primary key).  This affects logical replication
+	 * behavior, so round-trip fidelity matters.
+	 */
+	if (rel->rd_rel->relreplident != REPLICA_IDENTITY_DEFAULT)
+	{
+		resetStringInfo(&buf);
+		switch (rel->rd_rel->relreplident)
+		{
+			case REPLICA_IDENTITY_NOTHING:
+				appendStringInfo(&buf, "ALTER TABLE %s REPLICA IDENTITY NOTHING;",
+								 qualname);
+				statements = lappend(statements, pstrdup(buf.data));
+				break;
+			case REPLICA_IDENTITY_FULL:
+				appendStringInfo(&buf, "ALTER TABLE %s REPLICA IDENTITY FULL;",
+								 qualname);
+				statements = lappend(statements, pstrdup(buf.data));
+				break;
+			case REPLICA_IDENTITY_INDEX:
+				{
+					Oid			replidx = RelationGetReplicaIndex(rel);
+
+					if (OidIsValid(replidx))
+					{
+						appendStringInfo(&buf,
+										 "ALTER TABLE %s REPLICA IDENTITY USING INDEX %s;",
+										 qualname,
+										 quote_identifier(get_rel_name(replidx)));
+						statements = lappend(statements, pstrdup(buf.data));
+					}
+				}
+				break;
+		}
+	}
+
+	/* ENABLE / FORCE ROW LEVEL SECURITY */
+	if (rel->rd_rel->relrowsecurity)
+	{
+		resetStringInfo(&buf);
+		appendStringInfo(&buf, "ALTER TABLE %s ENABLE ROW LEVEL SECURITY;",
+						 qualname);
+		statements = lappend(statements, pstrdup(buf.data));
+	}
+	if (rel->rd_rel->relforcerowsecurity)
+	{
+		resetStringInfo(&buf);
+		appendStringInfo(&buf, "ALTER TABLE %s FORCE ROW LEVEL SECURITY;",
+						 qualname);
+		statements = lappend(statements, pstrdup(buf.data));
+	}
+
+	/*
+	 * Triggers — scaffolding only.  The standalone pg_get_trigger_ddl()
+	 * function (Phil's re-roll) is the intended emission path; once it
+	 * lands the body of this loop becomes a single call into it.  The
+	 * scan structure, lock acquisition, and tgisinternal filter (which
+	 * skips FK-backing and other system-generated triggers) are settled
+	 * here so that change stays minimal.
+	 */
+	{
+		Relation	trigRel;
+		SysScanDesc trigScan;
+		ScanKeyData trigKey;
+		HeapTuple	trigTup;
+
+		trigRel = table_open(TriggerRelationId, AccessShareLock);
+		ScanKeyInit(&trigKey,
+					Anum_pg_trigger_tgrelid,
+					BTEqualStrategyNumber, F_OIDEQ,
+					ObjectIdGetDatum(relid));
+		trigScan = systable_beginscan(trigRel, TriggerRelidNameIndexId,
+									  true, NULL, 1, &trigKey);
+		while (HeapTupleIsValid(trigTup = systable_getnext(trigScan)))
+		{
+			Form_pg_trigger trg = (Form_pg_trigger) GETSTRUCT(trigTup);
+
+			if (trg->tgisinternal)
+				continue;
+
+			/* TODO: append pg_get_trigger_ddl(trg->oid) output here. */
+			(void) trg;
+		}
+		systable_endscan(trigScan);
+		table_close(trigRel, AccessShareLock);
+	}
+
+	/*
+	 * Row-level security policies — scaffolding only.  Once
+	 * pg_get_policy_ddl() (already-submitted patch) lands, the body of
+	 * this loop becomes a per-policy call into it.  The ENABLE/FORCE
+	 * ROW LEVEL SECURITY toggles above are the companion catalog flags
+	 * and are already emitted independently of policies.
+	 */
+	{
+		Relation	polRel;
+		SysScanDesc polScan;
+		ScanKeyData polKey;
+		HeapTuple	polTup;
+
+		polRel = table_open(PolicyRelationId, AccessShareLock);
+		ScanKeyInit(&polKey,
+					Anum_pg_policy_polrelid,
+					BTEqualStrategyNumber, F_OIDEQ,
+					ObjectIdGetDatum(relid));
+		polScan = systable_beginscan(polRel, PolicyPolrelidPolnameIndexId,
+									 true, NULL, 1, &polKey);
+		while (HeapTupleIsValid(polTup = systable_getnext(polScan)))
+		{
+			Form_pg_policy pol = (Form_pg_policy) GETSTRUCT(polTup);
+
+			/* TODO: append pg_get_policy_ddl(relid, polname) output here. */
+			(void) pol;
+		}
+		systable_endscan(polScan);
+		table_close(polRel, AccessShareLock);
+	}
+
+	table_close(rel, AccessShareLock);
+	pfree(buf.data);
+
+	return statements;
+}
+
+/*
+ * pg_get_table_ddl
+ *		Return DDL to recreate a table as a set of text rows.
+ */
+Datum
+pg_get_table_ddl(PG_FUNCTION_ARGS)
+{
+	FuncCallContext *funcctx;
+	List	   *statements;
+
+	if (SRF_IS_FIRSTCALL())
+	{
+		MemoryContext oldcontext;
+		Oid			relid;
+		DdlOption	opts[] = {
+			{"pretty", DDL_OPT_BOOL},
+			{"owner", DDL_OPT_BOOL},
+			{"tablespace", DDL_OPT_BOOL},
+		};
+
+		funcctx = SRF_FIRSTCALL_INIT();
+		oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
+
+		if (PG_ARGISNULL(0))
+		{
+			MemoryContextSwitchTo(oldcontext);
+			SRF_RETURN_DONE(funcctx);
+		}
+
+		relid = PG_GETARG_OID(0);
+		parse_ddl_options(fcinfo, 1, opts, lengthof(opts));
+
+		statements = pg_get_table_ddl_internal(relid,
+											   opts[0].isset && opts[0].boolval,
+											   opts[1].isset && !opts[1].boolval,
+											   opts[2].isset && !opts[2].boolval);
 		funcctx->user_fctx = statements;
 		funcctx->max_calls = list_length(statements);
 
